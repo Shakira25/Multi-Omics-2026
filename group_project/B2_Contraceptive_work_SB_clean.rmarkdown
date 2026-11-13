@@ -1,0 +1,1081 @@
+---
+title: "B2 Contraceptive project: vaginal microbiome and host gene expression"
+author: "Shakira"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    embed-resources: true
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+# About this analysis
+
+**Study.** 93 women using one of three contraceptive methods: an **injectable**,
+a **pill**, or a vaginal **ring**. The ring releases its hormone locally in the
+vagina; the pill and the injectable act through the whole body (**systemic**).
+
+**Data (one sample per woman).**
+
+| File | What it holds |
+|---|---|
+| `01_metadata.csv` | arm, bacterial vaginosis (BV) status, Nugent score, pH, STI, RNA-seq batch |
+| `02_microbiome_counts.csv` | read counts for each bacterial species in each sample |
+| `03_microbiome_taxonomy.csv` | the taxonomy (genus, family, ...) of each species |
+| `04_rnaseq_counts.csv.gz` | raw RNA-seq read counts for each human gene in each sample |
+| `05_gene_annotation.csv` | gene symbol and name for each Ensembl gene ID |
+| `06_cytokines.csv` | cytokine concentrations (only checked in QC here) |
+
+**Questions answered in this document.**
+
+1. Do the three methods differ in vaginal community composition?
+2. Is bacterial vaginosis more common in one arm?
+3. Does the ring differ from the two systemic methods in host gene expression?
+4. Which biological processes do the ring versus systemic genes point to? (enrichment)
+5. If we group women by community type, does community type explain more of
+   their gene expression than the method does?
+6. Is bacterial vaginosis the explanation for whatever the method seems to do?
+
+Each question has the same four parts: **Question**, **Approach**, **Code**,
+and **Answer**. A summary of all answers is at the end.
+
+# Setup
+
+```{r setup}
+# Bioconductor packages are loaded first and tidyverse last, so that dplyr's
+# select(), filter() and rename() are the versions used in this document.
+suppressPackageStartupMessages({
+  library(phyloseq)        # container for microbiome data
+  library(microViz)        # microbiome distances, ordination and PERMANOVA
+  library(DESeq2)          # differential gene expression
+  library(vegan)           # PERMANOVA (adonis2) and dispersion tests
+  library(clusterProfiler) # gene set enrichment
+  library(org.Hs.eg.db)    # human gene annotation used by clusterProfiler
+  library(gtsummary)       # summary tables
+  library(gt)              # nicely formatted tables
+  library(patchwork)       # put several plots side by side
+  library(tidyverse)       # data wrangling and ggplot2
+})
+
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5.5)
+#theme_set(theme_minimal(base_size = 12))
+
+# Folders: the data folder sits next to this file; results go to "outputs".
+data_dir  <- "/workspaces/Multi-Omics-2026/data/2-workshop2/group_b_contraception"
+plot_dir  <- file.path("group_project", "outputs", "plots")
+table_dir <- file.path("group_project", "outputs", "tables")
+dir.create(plot_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Small helper to save every plot as a PNG in one line.
+save_plot <- function(plot, name, width = 8, height = 6) {
+  ggsave(file.path(plot_dir, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = 300, bg = "white")
+}
+```
+
+# Load the data
+
+```{r load-data}
+metadata   <- read_csv(file.path(data_dir, "01_metadata.csv"),          show_col_types = FALSE)
+species    <- read_csv(file.path(data_dir, "02_microbiome_counts.csv"), show_col_types = FALSE)
+taxonomy   <- read_csv(file.path(data_dir, "03_microbiome_taxonomy.csv"), show_col_types = FALSE)
+genes      <- read_csv(file.path(data_dir, "04_rnaseq_counts.csv.gz"),  show_col_types = FALSE)
+gene_annot <- read_csv(file.path(data_dir, "05_gene_annotation.csv"),   show_col_types = FALSE)
+cytokines  <- read_csv(file.path(data_dir, "06_cytokines.csv"),         show_col_types = FALSE)
+
+head(metadata)
+```
+
+# Quality checks
+
+**Why.** Before any test we confirm that the data are complete, that every
+sample appears once, and that the same samples are present in every table.
+
+```{r qc-metadata}
+glimpse(metadata)
+
+# Missing values per column (all should be 0)
+colSums(is.na(metadata))
+
+# Duplicated sample IDs (should be 0) and samples per woman (should all be 1)
+sum(duplicated(metadata$sample_id))
+metadata |> count(participant_id) |> count(n, name = "women")
+
+# Counts for each category
+metadata |> count(arm)
+metadata |> count(bv)
+metadata |> count(any_sti)
+metadata |> count(rnaseq_batch)
+
+# Range of the numeric fields
+summary(select(metadata, nugent, ph))
+```
+
+```{r qc-all-datasets}
+datasets <- list(
+  metadata = metadata, microbiome_counts = species, taxonomy = taxonomy,
+  rnaseq_counts = genes, gene_annotation = gene_annot, cytokines = cytokines
+)
+
+qc_table <- imap_dfr(datasets, function(data, name) {
+  tibble(
+    dataset        = name,
+    rows           = nrow(data),
+    columns        = ncol(data),
+    missing_cells  = sum(is.na(data)),
+    duplicate_rows = sum(duplicated(data))
+  )
+})
+knitr::kable(qc_table, caption = "Size and completeness of each dataset")
+
+# Do the microbiome, RNA-seq and cytokine tables hold the same samples as the metadata?
+tibble(
+  table = c("microbiome counts", "RNA-seq counts", "cytokines"),
+  same_samples_as_metadata = c(
+    setequal(names(species)[-1], metadata$sample_id),
+    setequal(names(genes)[-1],   metadata$sample_id),
+    setequal(cytokines$sample_id, metadata$sample_id)
+  )
+)
+```
+
+**QC result.** 93 women, one sample each, no missing values and no duplicated
+samples. The arms are injectable 39, pill 28 and ring 26. BV is positive in 51,
+negative in 39 and intermediate in 3. The two RNA-seq batches are balanced
+(47 and 46). The same 93 samples appear in every table, so no samples were
+dropped.
+
+# Question 1: Do the three methods differ in community composition?
+
+## Approach
+
+* **Community composition** means which bacteria are present and in what
+  proportions. We compare whole communities, not single species.
+* We turn every pair of samples into a **distance** (how different their
+  communities are). We use three common distances, because each one looks at
+  the data differently:
+  * **Bray-Curtis**: uses abundances, dominated by the common species.
+  * **Jaccard**: uses presence or absence only.
+  * **Aitchison**: uses log-ratios, which suits proportions (compositional data).
+* **PCoA** draws the distances as a 2-D map: each dot is a woman, and close dots
+  have similar communities. We colour the dots by arm.
+* **PERMANOVA** tests whether the arms differ. **R²** is the share of the
+  variation explained by arm, and the p-value comes from 999 random shuffles of
+  the arm labels.
+* A **dispersion test** checks that the arms are similarly spread out, because
+  PERMANOVA can give a false signal when one group is much more variable.
+
+## Code
+
+```{r build-phyloseq}
+# Build a phyloseq object: counts + taxonomy + sample information in one place.
+count_matrix <- species |> column_to_rownames("taxon") |> as.matrix()
+count_matrix <- count_matrix[, metadata$sample_id]   # same sample order as metadata
+
+taxonomy_matrix <- taxonomy |>
+  column_to_rownames("taxon") |>
+  as.matrix()
+taxonomy_matrix <- taxonomy_matrix[rownames(count_matrix), ]
+
+sample_info <- metadata |>
+  mutate(arm = factor(arm, levels = c("injectable", "pill", "ring"))) |>
+  column_to_rownames("sample_id") |>
+  as.data.frame()
+
+ps_species <- phyloseq(
+  otu_table(count_matrix, taxa_are_rows = TRUE),
+  sample_data(sample_info),
+  tax_table(taxonomy_matrix)
+)
+ps_species
+```
+
+```{r community-ordination, fig.width = 15, fig.height = 5.5}
+make_pcoa <- function(distance, transform, title) {
+  ps_species |>
+    tax_transform(transform, rank = "species") |>
+    dist_calc(distance) |>
+    ord_calc("PCoA") |>
+    ord_plot(colour = "arm", size = 2.5) +
+    labs(title = title)
+}
+
+community_plot <- wrap_plots(
+  make_pcoa("bray",      "identity", "Bray-Curtis"),
+  make_pcoa("jaccard",   "binary",   "Jaccard"),
+  make_pcoa("aitchison", "identity", "Aitchison"),
+  ncol = 3, guides = "collect"
+) & theme(legend.position = "bottom")
+
+community_plot
+save_plot(community_plot, "q1_community_pcoa_by_arm", width = 15, height = 5.5)
+```
+
+```{r community-permanova}
+# PERMANOVA (does composition differ by arm?) and dispersion test (equal spread?)
+test_arm <- function(distance, transform, label) {
+  dist_obj <- ps_species |>
+    tax_transform(transform, rank = "species") |>
+    dist_calc(distance)
+
+  perm <- dist_obj |>
+    dist_permanova(variables = "arm", n_perms = 999, seed = 1) |>
+    perm_get() |>
+    as.data.frame()
+
+  set.seed(1)
+  disp <- permutest(betadisper(dist_get(dist_obj), sample_info$arm), permutations = 999)
+
+  tibble(
+    Distance       = label,
+    R2             = perm["arm", "R2"],
+    F              = perm["arm", "F"],
+    p_PERMANOVA    = perm["arm", "Pr(>F)"],
+    p_dispersion   = disp$tab[1, "Pr(>F)"]
+  )
+}
+
+community_tests <- bind_rows(
+  test_arm("bray",      "identity", "Bray-Curtis"),
+  test_arm("jaccard",   "binary",   "Jaccard"),
+  test_arm("aitchison", "identity", "Aitchison")
+)
+
+community_tests_gt <- community_tests |>
+  gt() |>
+  fmt_number(c(R2, p_PERMANOVA, p_dispersion), decimals = 3) |>
+  fmt_number(F, decimals = 2) |>
+  cols_label(R2 = "R²", p_PERMANOVA = "PERMANOVA p", p_dispersion = "Dispersion p") |>
+  tab_header(title = "Community composition by contraceptive arm",
+             subtitle = "PERMANOVA with 999 permutations; dispersion test checks equal spread")
+community_tests_gt
+gtsave(community_tests_gt, file.path(table_dir, "q1_community_permanova.html"))
+```
+
+## Answer
+
+**No. The three methods do not differ in vaginal community composition.**
+
+* **Maps:** in all three PCoA maps the injectable, pill and ring dots are mixed
+  together. The Bray-Curtis map does show clear clusters, but every cluster
+  contains all three arms, so the clusters are not caused by the method
+  (Question 5 shows they are community types).
+* **PERMANOVA:** arm explains only about 3% of the variation, and no distance
+  gives p < 0.05:
+
+  | Distance | R² | PERMANOVA p | Dispersion p |
+  |---|---|---|---|
+  | Bray-Curtis | 0.033 | 0.086 | 0.77 |
+  | Jaccard | 0.026 | 0.206 | 0.25 |
+  | Aitchison | 0.028 | 0.158 | 0.91 |
+
+* **Dispersion:** all dispersion p-values are well above 0.05, so the arms are
+  equally spread out and the PERMANOVA results are not distorted.
+
+# Question 2: Is bacterial vaginosis more common in one arm?
+
+## Approach
+
+* BV was recorded as negative, intermediate or positive. Only 3 women were
+  intermediate, so for the test we compare **positive** against **not
+  positive** (negative + intermediate). A first table still shows all three
+  categories so nothing is hidden.
+* We compare the percentage BV-positive in each arm with a **chi-square test**.
+  If any expected cell count is below 5, the code switches to **Fisher's exact
+  test**, which is safer for small numbers.
+* This tests an association only; it cannot show that a method causes BV.
+
+## Code
+
+```{r bv-by-arm}
+bv_data <- metadata |>
+  mutate(
+    arm       = factor(arm, levels = c("injectable", "pill", "ring")),
+    bv        = factor(bv,  levels = c("negative", "intermediate", "positive")),
+    bv_status = factor(if_else(bv == "positive", "Positive", "Not positive"),
+                       levels = c("Not positive", "Positive"))
+  )
+
+# Table 1: all three BV categories by arm (descriptive only)
+bv_categories_table <- tbl_cross(
+  bv_data, row = bv, col = arm, percent = "column", margin = "column",
+  label = list(bv ~ "BV category", arm ~ "Contraceptive arm")
+) |>
+  modify_caption("**BV categories by contraceptive arm**")
+bv_categories_table
+
+# Choose the test: chi-square unless any expected count is below 5
+expected_counts <- suppressWarnings(chisq.test(table(bv_data$bv_status, bv_data$arm))$expected)
+bv_test <- if (any(expected_counts < 5)) "fisher.test" else "chisq.test"
+bv_test
+
+# Table 2: BV positive vs not positive, with the test
+bv_prevalence_table <- tbl_cross(
+  bv_data, row = bv_status, col = arm, percent = "column", margin = "column",
+  label = list(bv_status ~ "BV status", arm ~ "Contraceptive arm")
+) |>
+  add_p(test = bv_test, pvalue_fun = label_style_pvalue(digits = 3)) |>
+  modify_caption("**BV-positive prevalence by contraceptive arm**")
+bv_prevalence_table
+
+gtsave(as_gt(bv_categories_table), file.path(table_dir, "q2_bv_categories_by_arm.html"))
+gtsave(as_gt(bv_prevalence_table), file.path(table_dir, "q2_bv_prevalence_by_arm.html"))
+```
+
+## Answer
+
+**No. BV is not more common in any one arm.**
+
+| Arm | BV positive |
+|---|---|
+| Injectable | 19 / 39 (48.7%) |
+| Pill | 10 / 28 (35.7%) |
+| Ring | 10 / 26 (38.5%) |
+
+All expected counts were at least 5, so the chi-square test was used:
+p = 0.52. The injectable arm has slightly more BV, but a difference this size
+is easily explained by chance with these numbers. BV is spread fairly evenly
+across the arms, which matters for Question 6.
+
+# Question 3: Does the ring differ from the systemic methods in host gene expression?
+
+## Approach
+
+1. **Make two groups.** Pill and injectable are combined into one **systemic**
+   group (n = 67) and compared with the **ring** (n = 26), as the study design
+   suggests.
+2. **Check and filter the counts.** Confirm the counts are whole numbers, line
+   up the samples with the metadata, check that batch and group can be
+   separated (both batches contain ring and systemic samples), and drop genes
+   that are barely expressed (fewer than 10 reads in at least 10 samples).
+3. **Ordinate the genes first (big picture).** Apply a variance-stabilising
+   transformation (VST) so that all genes are on a comparable scale, then draw a
+   **PCA**. Colour it by delivery group and batch, and then by BV, arm and pH to
+   see what drives the main pattern.
+4. **Test all genes together.** PERMANOVA on the VST values, with batch entered
+   first, plus a dispersion test.
+5. **Test gene by gene.** **DESeq2** on the raw counts, adjusting for batch.
+   A positive log2 fold change means higher in ring. With about 14,000 genes
+   tested, we use **Benjamini-Hochberg adjusted p-values** (`padj`) and call a
+   gene significant when `padj < 0.05`.
+6. **Show the results.** A table of significant genes, a volcano plot, box
+   plots of the top genes and a heatmap.
+
+## Code
+
+### Prepare the counts
+
+```{r gene-prepare}
+# Raw counts as a matrix: genes in rows, samples in columns (same order as metadata)
+gene_counts <- genes |> column_to_rownames("ensembl_gene_id") |> as.matrix()
+gene_counts <- gene_counts[, metadata$sample_id]
+
+stopifnot(all(gene_counts >= 0), all(gene_counts == round(gene_counts)))  # raw integer counts
+storage.mode(gene_counts) <- "integer"
+
+# Sample information for the gene analysis
+gene_coldata <- metadata |>
+  mutate(
+    arm            = factor(arm, levels = c("injectable", "pill", "ring")),
+    delivery_group = factor(if_else(arm == "ring", "ring", "systemic"),
+                            levels = c("systemic", "ring")),
+    rnaseq_batch   = factor(rnaseq_batch),
+    bv_status      = factor(if_else(bv == "positive", "Positive", "Not positive"),
+                            levels = c("Not positive", "Positive"))
+  ) |>
+  as.data.frame()
+rownames(gene_coldata) <- gene_coldata$sample_id
+
+# Batch must not be confounded with delivery group
+table(gene_coldata$rnaseq_batch, gene_coldata$delivery_group)
+
+# Keep genes with at least 10 reads in at least 10 samples
+keep_gene <- rowSums(gene_counts >= 10) >= 10
+gene_counts_filtered <- gene_counts[keep_gene, ]
+c(genes_before = nrow(gene_counts), genes_after_filter = nrow(gene_counts_filtered))
+```
+
+### Ordinate the genes (PCA)
+
+```{r gene-pca}
+dds <- DESeqDataSetFromMatrix(
+  countData = gene_counts_filtered,
+  colData   = gene_coldata,
+  design    = ~ rnaseq_batch + delivery_group
+)
+
+# VST is used for pictures and the overall test only (DESeq2 itself uses raw counts)
+vsd <- vst(dds, blind = TRUE)
+
+# PC scores for each sample (top 500 most variable genes), then add the sample information
+pca_raw     <- plotPCA(vsd, intgroup = "delivery_group", returnData = TRUE)
+pca_percent <- round(100 * attr(pca_raw, "percentVar"))
+pca_data    <- pca_raw |>
+  select(PC1, PC2, sample_id = name) |>
+  left_join(gene_coldata, by = "sample_id")
+pca_axes <- labs(x = paste0("PC1 (", pca_percent[1], "%)"),
+                 y = paste0("PC2 (", pca_percent[2], "%)"))
+
+gene_pca_plot <- ggplot(pca_data, aes(PC1, PC2, colour = delivery_group, shape = rnaseq_batch)) +
+  geom_point(size = 3, alpha = 0.85) +
+  pca_axes +
+  labs(title = "PCA of host gene expression",
+       colour = "Delivery group", shape = "RNA-seq batch")
+gene_pca_plot
+save_plot(gene_pca_plot, "q3_gene_pca_delivery_batch")
+```
+
+### What else could explain the main gene pattern?
+
+```{r gene-pca-other, fig.width = 15, fig.height = 5}
+pca_bv  <- ggplot(pca_data, aes(PC1, PC2, colour = bv)) +
+  geom_point(size = 2.5, alpha = 0.85) + pca_axes + labs(title = "Coloured by BV", colour = "BV")
+pca_arm <- ggplot(pca_data, aes(PC1, PC2, colour = arm)) +
+  geom_point(size = 2.5, alpha = 0.85) + pca_axes + labs(title = "Coloured by arm", colour = "Arm")
+pca_ph  <- ggplot(pca_data, aes(PC1, PC2, colour = ph)) +
+  geom_point(size = 2.5, alpha = 0.85) + scale_colour_viridis_c() + pca_axes +
+  labs(title = "Coloured by vaginal pH", colour = "pH")
+
+pca_other_plot <- pca_bv + pca_arm + pca_ph
+pca_other_plot
+save_plot(pca_other_plot, "q3_gene_pca_bv_arm_ph", width = 15, height = 5)
+```
+
+### Test all genes together (PERMANOVA)
+
+```{r gene-permanova}
+vst_matrix <- assay(vsd)                 # genes x samples, VST scale
+vst_dist   <- dist(t(vst_matrix))        # Euclidean distance between samples
+
+set.seed(1)
+gene_permanova <- adonis2(vst_dist ~ rnaseq_batch + delivery_group,
+                          data = gene_coldata, permutations = 999, by = "terms")
+gene_permanova
+
+set.seed(1)
+gene_dispersion <- permutest(betadisper(vst_dist, gene_coldata$delivery_group), permutations = 999)
+gene_dispersion
+```
+
+### Test gene by gene (DESeq2)
+
+```{r gene-deseq2}
+dds <- DESeq(dds)
+
+# Positive log2 fold change = higher in ring than in systemic
+gene_results_table <- results(dds, contrast = c("delivery_group", "ring", "systemic"), alpha = 0.05) |>
+  as.data.frame() |>
+  rownames_to_column("ensembl_gene_id") |>
+  left_join(select(gene_annot, ensembl_gene_id, symbol, gene_name), by = "ensembl_gene_id") |>
+  arrange(padj)
+
+sig_genes <- gene_results_table |>
+  filter(!is.na(padj), padj < 0.05) |>
+  mutate(fold_change = 2^log2FoldChange,
+         direction   = if_else(log2FoldChange > 0, "Higher in ring", "Higher in systemic"))
+
+tibble(
+  ring_samples       = sum(gene_coldata$delivery_group == "ring"),
+  systemic_samples   = sum(gene_coldata$delivery_group == "systemic"),
+  genes_tested       = sum(!is.na(gene_results_table$padj)),
+  significant_genes  = nrow(sig_genes),
+  higher_in_ring     = sum(sig_genes$direction == "Higher in ring"),
+  higher_in_systemic = sum(sig_genes$direction == "Higher in systemic"),
+  median_abs_log2FC  = round(median(abs(sig_genes$log2FoldChange)), 2)
+) |> knitr::kable(caption = "DESeq2 summary: ring versus systemic")
+
+write_csv(gene_results_table, file.path(table_dir, "q3_genes_ring_vs_systemic_all.csv"))
+write_csv(sig_genes,          file.path(table_dir, "q3_genes_ring_vs_systemic_significant.csv"))
+```
+
+### Table of the top significant genes
+
+```{r gene-table}
+sig_gene_gt <- sig_genes |>
+  slice_head(n = 20) |>
+  select(symbol, gene_name, direction, baseMean, log2FoldChange, fold_change, pvalue, padj) |>
+  gt() |>
+  fmt_number(c(baseMean, log2FoldChange, fold_change), decimals = 2) |>
+  fmt_scientific(c(pvalue, padj), decimals = 1) |>
+  cols_label(symbol = "Gene", gene_name = "Name", direction = "Direction",
+             baseMean = "Mean count", log2FoldChange = "Log2 FC",
+             fold_change = "Fold change", pvalue = "Nominal p", padj = "Adjusted p") |>
+  tab_header(title = "Top 20 genes, ring versus systemic",
+             subtitle = "Fold change = ring / systemic; full list in the CSV file")
+sig_gene_gt
+gtsave(sig_gene_gt, file.path(table_dir, "q3_top20_significant_genes.html"))
+```
+
+### Visualise the results
+
+```{r gene-volcano}
+volcano_data <- gene_results_table |>
+  filter(!is.na(padj)) |>
+  mutate(result = case_when(
+    padj < 0.05 & log2FoldChange > 0 ~ "Higher in ring",
+    padj < 0.05 & log2FoldChange < 0 ~ "Higher in systemic",
+    TRUE                             ~ "Not significant"
+  ))
+
+volcano_plot <- ggplot(volcano_data, aes(log2FoldChange, -log10(padj), colour = result)) +
+  geom_point(alpha = 0.6, size = 1.3) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey40") +
+  scale_colour_manual(values = c("Higher in ring" = "#B2182B",
+                                 "Higher in systemic" = "#2166AC",
+                                 "Not significant" = "grey75")) +
+  labs(title = "Volcano plot: ring versus systemic",
+       x = "Log2 fold change (ring / systemic)", y = "-log10 adjusted p-value", colour = NULL)
+volcano_plot
+save_plot(volcano_plot, "q3_volcano")
+```
+
+```{r gene-boxplots, fig.width = 10, fig.height = 6.5}
+top6 <- sig_genes |> slice_head(n = 6)
+
+boxplot_data <- vst_matrix[top6$ensembl_gene_id, ] |>
+  as.data.frame() |>
+  rownames_to_column("ensembl_gene_id") |>
+  pivot_longer(-ensembl_gene_id, names_to = "sample_id", values_to = "vst_expression") |>
+  left_join(select(top6, ensembl_gene_id, symbol), by = "ensembl_gene_id") |>
+  left_join(select(gene_coldata, sample_id, delivery_group), by = "sample_id") |>
+  mutate(symbol = factor(symbol, levels = top6$symbol))
+
+boxplot_plot <- ggplot(boxplot_data, aes(delivery_group, vst_expression, fill = delivery_group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.12, alpha = 0.5, size = 1) +
+  facet_wrap(~ symbol, scales = "free_y", ncol = 3) +
+  labs(title = "Six top-ranked genes (one dot per woman)",
+       x = NULL, y = "Expression (VST scale)") +
+  theme(legend.position = "none")
+boxplot_plot
+save_plot(boxplot_plot, "q3_top6_boxplots", width = 10, height = 6.5)
+```
+
+```{r gene-heatmap, fig.width = 12, fig.height = 6.5}
+top20 <- sig_genes |> slice_head(n = 20)
+
+heatmap_z <- t(scale(t(vst_matrix[top20$ensembl_gene_id, ])))   # z-score each gene
+rownames(heatmap_z) <- top20$symbol
+
+heatmap_data <- heatmap_z |>
+  as.data.frame() |>
+  rownames_to_column("symbol") |>
+  pivot_longer(-symbol, names_to = "sample_id", values_to = "z") |>
+  left_join(select(gene_coldata, sample_id, delivery_group), by = "sample_id") |>
+  mutate(symbol = factor(symbol, levels = rev(top20$symbol)))
+
+heatmap_plot <- ggplot(heatmap_data, aes(sample_id, symbol, fill = z)) +
+  geom_tile() +
+  facet_grid(~ delivery_group, scales = "free_x", space = "free_x") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", name = "z-score") +
+  labs(title = "Top 20 genes across women", x = "Women", y = NULL) +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank())
+heatmap_plot
+save_plot(heatmap_plot, "q3_top20_heatmap", width = 12, height = 6.5)
+```
+
+## Answer
+
+**Yes, but the difference is modest: it is limited to a set of genes, not the
+whole transcriptome.**
+
+* **Ordination (PCA):** ring and systemic samples overlap completely, and the
+  two batches are mixed through both groups. There is no big split between
+  ring and systemic. PC1 (34% of the variation) is not explained by delivery
+  group, batch, arm, BV or pH; none of these colourings lines up with it.
+  The arms overlap, so merging pill and injectable into "systemic" is reasonable.
+* **All genes together (PERMANOVA):** delivery group explains 1.8% of the
+  variation, p = 0.047 (batch: 1.5%, p = 0.13). The dispersion test is not
+  significant (p = 0.80), so this is a small, real shift rather than one group
+  being more variable. Weak evidence of an overall difference.
+* **Gene by gene (DESeq2):** **165 of 14,221 genes** differ at padj < 0.05:
+  **88 higher in ring** and **77 higher in systemic**. Most changes are
+  modest: the median significant gene changes about 2-fold (median absolute
+  log2 fold change 1.08), and 68 of the 165 change by less than 2-fold.
+* **Top genes:** BPIFA1 stands out, about 43 times higher in ring.
+  IL1A (about 4.8-fold), CHGA (about 4.5-fold) and PTGS2 are also higher in
+  ring; UPK3B, CEACAM7, FBLN2, KRT1 and LORICRIN are higher in systemic.
+* **Box plots and heatmap:** the ring group is shifted for these genes but is
+  also spread out; some ring users look like systemic users. The ring effect is
+  a shift in the typical level, not a change seen in every ring user.
+
+This is an association. It does not prove that local delivery causes the
+change; Question 6 checks whether BV could explain it.
+
+# Question 4: Which biological processes do the ring versus systemic genes point to?
+
+## Approach
+
+A list of 165 genes is hard to read one by one. **Enrichment analysis** asks
+whether genes that share a biological role (a **GO biological process**, such
+as "immune response" or "cilium movement") turn up in our list more often than
+chance would predict. We use two complementary methods:
+
+1. **Over-representation analysis (ORA).** Take the significant genes (separately
+   for *higher in ring* and *higher in systemic*) and ask whether any GO process
+   is over-represented compared with the **background** of all genes we tested.
+   Using the tested genes as background is important: it stops us "finding"
+   processes simply because they are expressed in vaginal tissue.
+2. **Gene set enrichment analysis (GSEA).** Instead of a cut-off, rank **all**
+   tested genes from most "ring-up" to most "systemic-up" (by the DESeq2
+   statistic) and ask whether the genes of a process cluster at the top or the
+   bottom of the list. GSEA can pick up processes where many genes shift a
+   little, which ORA misses.
+
+Both methods correct for testing thousands of processes (Benjamini-Hochberg),
+and we call a process enriched when its adjusted p-value is below 0.05.
+
+## Code
+
+```{r enrichment-ora, fig.width = 10, fig.height = 7}
+background_genes <- gene_results_table |> filter(!is.na(padj)) |> pull(ensembl_gene_id)
+
+gene_lists <- list(
+  `Higher in ring`     = sig_genes |> filter(direction == "Higher in ring")     |> pull(ensembl_gene_id),
+  `Higher in systemic` = sig_genes |> filter(direction == "Higher in systemic") |> pull(ensembl_gene_id)
+)
+
+ora_go <- compareCluster(
+  geneClusters  = gene_lists,
+  fun           = "enrichGO",
+  universe      = background_genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ora_table <- as.data.frame(ora_go)
+ora_table |> count(Cluster, name = "enriched_GO_processes")
+
+ora_plot <- dotplot(ora_go, showCategory = 10) +
+  labs(title = "GO processes over-represented among significant genes")
+ora_plot
+save_plot(ora_plot, "q4_go_ora_dotplot", width = 10, height = 7)
+write_csv(ora_table, file.path(table_dir, "q4_go_ora_results.csv"))
+```
+
+```{r enrichment-gsea, fig.width = 11, fig.height = 7}
+# Rank every tested gene by the DESeq2 Wald statistic (positive = higher in ring)
+gene_ranks <- gene_results_table |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::arrange(desc(stat)) |>
+  dplyr::select(ensembl_gene_id, stat) |>
+  deframe()
+
+set.seed(1)
+gsea_go <- gseGO(
+  geneList     = gene_ranks,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "ENSEMBL",
+  ont          = "BP",
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  eps          = 0,
+  seed         = TRUE,
+  verbose      = FALSE
+)
+gsea_go <- setReadable(gsea_go, OrgDb = org.Hs.eg.db, keyType = "ENSEMBL")
+
+gsea_table <- as.data.frame(gsea_go) |>
+  dplyr::mutate(direction = if_else(NES > 0, "Higher in ring", "Higher in systemic"))
+gsea_table |> dplyr::count(direction, name = "enriched_GO_processes")
+
+# Top 10 processes in each direction
+gsea_table |>
+  dplyr::group_by(direction) |>
+  dplyr::slice_max(abs(NES), n = 10) |>
+  dplyr::ungroup() |>
+  dplyr::select(direction, Description, setSize, NES, p.adjust) |>
+  gt(groupname_col = "direction") |>
+  fmt_number(NES, decimals = 2) |>
+  fmt_scientific(p.adjust, decimals = 1) |>
+  cols_label(Description = "GO biological process", setSize = "Genes in set",
+             p.adjust = "Adjusted p") |>
+  tab_header(title = "GSEA: top GO processes in each direction",
+             subtitle = "NES > 0 means the process is shifted up in ring")
+
+gsea_plot <- dotplot(gsea_go, showCategory = 10, split = ".sign") +
+  facet_grid(. ~ .sign, labeller = as_labeller(c(activated = "Higher in ring",
+                                                 suppressed = "Higher in systemic"))) +
+  labs(title = "GSEA of GO biological processes")
+gsea_plot
+save_plot(gsea_plot, "q4_go_gsea_dotplot", width = 11, height = 7)
+write_csv(gsea_table, file.path(table_dir, "q4_go_gsea_results.csv"))
+```
+
+## Answer
+
+**Ring genes point to cell division (epithelial proliferation); systemic genes
+point to skin-like keratinisation of the epithelium.** Both methods agree.
+
+* **Higher in ring: cell division.** ORA found 141 enriched processes, and
+  the top ones are all about dividing cells: organelle fission (24 of the 82 ring
+  genes that have a GO annotation, padj = 8e-14), nuclear and mitotic division, chromosome segregation and
+  spindle assembly. GSEA, which uses all genes, finds the same theme
+  (587 processes; top: chromosome segregation, mitotic sister chromatid
+  segregation, cell cycle checkpoint signalling, DNA replication, all
+  padj < 1e-13).
+* **Higher in systemic: keratinisation.** ORA found 5 processes, all about the
+  same thing: epidermis development, skin development, keratinocyte
+  differentiation, keratinisation and peptide cross-linking (padj = 0.04).
+  GSEA confirms it (140 processes; top: keratinisation, epidermis development,
+  epidermal cell differentiation; padj < 1e-4), and genes such as KRT1 and
+  LORICRIN in Question 3 belong to these processes.
+
+**In plain words:** the vaginal lining of ring users appears to be renewing
+itself more actively, while the lining of pill and injectable users shows more
+of the tough, skin-like "keratinised" programme. This fits the idea that a
+locally released hormone acts directly on the vaginal epithelium. These are
+patterns in gene lists, not measurements of the tissue itself, so they suggest
+biology rather than prove it.
+
+# Question 5: Does community type explain more than the method does?
+
+## Approach
+
+1. **Group women by community type.** For each woman we find the bacterial
+   species with the largest share of her reads and name her community after it.
+   This is a simple version of the **community state types (CSTs)** used in
+   vaginal microbiome research:
+   * *L. crispatus* / other *Lactobacillus* dominated (CST I, II and V; only
+     4 women had *L. jensenii* or *L. hominis* on top, too few for their own
+     group, so they join *L. crispatus*),
+   * *L. iners* dominated (CST III),
+   * diverse / anaerobe dominated, where a non-*Lactobacillus* species such as
+     *Gardnerella* or *Prevotella* is on top (CST IV, the type linked to BV).
+2. **Describe the groups.** How many women are in each type, how dominant the
+   top species is, and how community type lines up with arm and BV.
+3. **Test their genes, fairly against the method.**
+   * **PERMANOVA** on the VST gene expression with batch, community type and arm
+     in the **same** model, using `by = "margin"`, so each term is judged after
+     the other is accounted for. Comparing the R² values tells us which explains
+     more of the variation in gene expression.
+   * **DESeq2 likelihood ratio tests (LRT).** From the full model
+     `~ batch + community type + arm`, drop community type to count the genes
+     it affects, then drop arm to count the genes the method affects.
+
+## Code
+
+```{r community-types}
+rel_abund <- sweep(count_matrix, 2, colSums(count_matrix), "/")   # proportions per sample
+
+community_types <- tibble(
+  sample_id = colnames(rel_abund),
+  top_taxon = rownames(rel_abund)[apply(rel_abund, 2, which.max)],
+  top_share = apply(rel_abund, 2, max)
+) |>
+  mutate(community_type = case_when(
+    top_taxon == "lactobacillus_iners"     ~ "L. iners",
+    str_starts(top_taxon, "lactobacillus") ~ "L. crispatus / other Lactobacillus",
+    TRUE                                   ~ "Diverse / anaerobe"
+  ),
+  community_type = factor(community_type,
+                          levels = c("L. crispatus / other Lactobacillus", "L. iners", "Diverse / anaerobe")))
+
+# Which species top the list, and how dominant are they?
+community_types |>
+  group_by(community_type, top_taxon) |>
+  summarise(women = n(), median_top_share = round(median(top_share), 2), .groups = "drop") |>
+  arrange(community_type, desc(women)) |>
+  knitr::kable(caption = "Dominant species in each community type")
+
+gene_coldata <- gene_coldata |>
+  dplyr::select(-any_of("community_type")) |>
+  dplyr::left_join(dplyr::select(community_types, sample_id, community_type), by = "sample_id")
+rownames(gene_coldata) <- gene_coldata$sample_id
+
+# Sanity check: the community types should form the clusters seen in the microbiome map (Question 1)
+ps_species <- ps_species |>
+  ps_join(dplyr::select(community_types, sample_id, community_type), match_sample_names = "sample_id")
+ct_pcoa_plot <- ps_species |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("bray") |>
+  ord_calc("PCoA") |>
+  ord_plot(colour = "community_type", size = 2.5) +
+  labs(title = "Microbiome map (Bray-Curtis) coloured by community type", colour = "Community type")
+ct_pcoa_plot
+save_plot(ct_pcoa_plot, "q5_microbiome_pcoa_community_type")
+
+# Community type by arm, and community type by BV
+tbl_cross(gene_coldata, row = community_type, col = arm, percent = "column",
+          label = list(community_type ~ "Community type", arm ~ "Arm")) |>
+  add_p(test = "fisher.test", test.args = list(simulate.p.value = TRUE, B = 10000)) |>
+  modify_caption("**Community type by contraceptive arm**")
+
+tbl_cross(gene_coldata, row = community_type, col = bv, percent = "column",
+          label = list(community_type ~ "Community type", bv ~ "BV")) |>
+  modify_caption("**Community type by BV status**")
+```
+
+```{r community-types-pca}
+pca_ct_data <- pca_data |>
+  dplyr::left_join(dplyr::select(gene_coldata, sample_id, community_type), by = "sample_id")
+
+pca_ct_plot <- ggplot(pca_ct_data, aes(PC1, PC2, colour = community_type)) +
+  geom_point(size = 3, alpha = 0.85) +
+  pca_axes +
+  labs(title = "Host gene PCA coloured by community type", colour = "Community type")
+pca_ct_plot
+save_plot(pca_ct_plot, "q5_gene_pca_community_type")
+```
+
+```{r community-types-permanova}
+set.seed(1)
+ct_permanova <- adonis2(vst_dist ~ rnaseq_batch + community_type + arm,
+                        data = gene_coldata, permutations = 999, by = "margin")
+ct_permanova
+
+ct_permanova_table <- as.data.frame(ct_permanova) |>
+  rownames_to_column("term") |>
+  dplyr::filter(term %in% c("community_type", "arm")) |>
+  dplyr::transmute(Term = recode(term, community_type = "Community type", arm = "Method (arm)"),
+                  df = Df, `R² (%)` = round(100 * R2, 1), F = round(F, 2), p = `Pr(>F)`)
+knitr::kable(ct_permanova_table, caption = "Gene expression explained by each term, after the other (PERMANOVA)")
+```
+
+```{r community-types-deseq2}
+dds_ct <- DESeqDataSetFromMatrix(
+  countData = gene_counts_filtered,
+  colData   = gene_coldata,
+  design    = ~ rnaseq_batch + community_type + arm
+)
+
+# Genes affected by community type (after accounting for arm and batch)
+dds_ct_lrt <- DESeq(dds_ct, test = "LRT", reduced = ~ rnaseq_batch + arm)
+res_ct     <- results(dds_ct_lrt)
+
+# Genes affected by arm (after accounting for community type and batch)
+dds_arm_lrt <- DESeq(dds_ct, test = "LRT", reduced = ~ rnaseq_batch + community_type)
+res_arm     <- results(dds_arm_lrt)
+
+lrt_summary <- tibble(
+  Term = c("Community type", "Method (arm)"),
+  `Genes with padj < 0.05` = c(sum(res_ct$padj < 0.05, na.rm = TRUE),
+                               sum(res_arm$padj < 0.05, na.rm = TRUE))
+)
+knitr::kable(lrt_summary, caption = "DESeq2 likelihood ratio tests (genes tested = 14,221)")
+```
+
+## Answer
+
+**Only partly. Community type changes more individual genes than the method
+does, but neither explains much of a woman's overall gene expression.**
+
+* **The groups are real and independent of method.** The three community types
+  form three clean clusters on the microbiome map (25 *L. crispatus* / other
+  *Lactobacillus*, 28 *L. iners*, 40 diverse / anaerobe). These are the clusters
+  seen in Question 1. Every arm contains all three types (Fisher p ≈ 0.2), so
+  community type and method can be compared fairly.
+* **Community type is almost the same thing as BV.** 37 of the 40 women with a
+  diverse / anaerobe community are BV positive, against 2 of the 53 women with a
+  *Lactobacillus* community.
+* **Overall gene expression (PERMANOVA, each term after the other):**
+
+  | Term | df | R² | p |
+  |---|---|---|---|
+  | Community type | 2 | 2.4% | 0.27 |
+  | Method (arm) | 2 | 2.7% | 0.14 |
+
+  Both explain under 3% and neither is significant. Community type does
+  **not** explain more of the overall profile, and on the gene PCA the community
+  types are mixed together, just like the arms.
+* **Individual genes (DESeq2 LRT):** **225 genes** change with community type,
+  against **115 genes** with method. Community type affects about twice as
+  many genes, but it acts on a specific set of genes, not the whole profile.
+
+**In plain words:** knowing a woman's bacteria tells you about more single
+genes than knowing her contraceptive, but neither tells you much about her
+overall gene-expression pattern. The large PC1 pattern is driven by something
+not measured here.
+
+# Question 6: Is bacterial vaginosis the explanation for what the method seems to do?
+
+## Approach
+
+For BV to "explain" the ring effect, two things would both need to be true:
+**(a)** BV is linked to the method (more or less common with the ring), and
+**(b)** BV is linked to gene expression. If both hold, the ring genes could
+just be BV genes in disguise. We check this in four steps:
+
+1. **Is BV linked to the method?** Already answered in Question 2.
+2. **Is BV linked to gene expression?** PERMANOVA and DESeq2 with BV in the model.
+3. **Adjust for BV.** Refit the ring versus systemic DESeq2 model as
+   `~ batch + BV + delivery group`. If BV is the explanation, the 165 ring genes
+   should lose their significance and their fold changes should shrink.
+4. **Stratify by BV.** Repeat ring versus systemic separately in BV-positive and
+   in BV-not-positive women. If the ring genes move in the same direction in
+   both groups, the ring effect does not depend on BV.
+
+## Code
+
+```{r bv-explanation-permanova}
+set.seed(1)
+bv_permanova <- adonis2(vst_dist ~ rnaseq_batch + bv_status + delivery_group,
+                        data = gene_coldata, permutations = 999, by = "margin")
+bv_permanova
+```
+
+```{r bv-explanation-deseq2}
+dds_bv <- DESeqDataSetFromMatrix(
+  countData = gene_counts_filtered,
+  colData   = gene_coldata,
+  design    = ~ rnaseq_batch + bv_status + delivery_group
+)
+dds_bv <- DESeq(dds_bv)
+
+# Genes linked to BV (after batch and delivery group)
+res_bv_effect <- results(dds_bv, contrast = c("bv_status", "Positive", "Not positive"))
+
+# Ring versus systemic, now adjusted for BV
+res_ring_adj <- results(dds_bv, contrast = c("delivery_group", "ring", "systemic")) |>
+  as.data.frame() |>
+  rownames_to_column("ensembl_gene_id")
+
+compare_fc <- sig_genes |>
+  dplyr::select(ensembl_gene_id, symbol, log2FC_unadjusted = log2FoldChange) |>
+  dplyr::left_join(dplyr::select(res_ring_adj, ensembl_gene_id, log2FC_BV_adjusted = log2FoldChange,
+                               padj_BV_adjusted = padj), by = "ensembl_gene_id")
+
+tibble(
+  `Genes linked to BV (padj < 0.05)`                    = sum(res_bv_effect$padj < 0.05, na.rm = TRUE),
+  `Ring genes before BV adjustment`                    = nrow(sig_genes),
+  `Ring genes after BV adjustment`                     = sum(res_ring_adj$padj < 0.05, na.rm = TRUE),
+  `Original 165 still significant after adjustment`    = sum(compare_fc$padj_BV_adjusted < 0.05, na.rm = TRUE),
+  `Correlation of fold changes (before vs after)`      = round(cor(compare_fc$log2FC_unadjusted,
+                                                                   compare_fc$log2FC_BV_adjusted), 3)
+) |>
+  pivot_longer(everything(), names_to = "Check", values_to = "Result") |>
+  knitr::kable(caption = "Does adjusting for BV remove the ring effect?")
+
+bv_adjust_plot <- ggplot(compare_fc, aes(log2FC_unadjusted, log2FC_BV_adjusted)) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_point(colour = "#B2182B", alpha = 0.7) +
+  labs(title = "Ring genes: fold change before and after adjusting for BV",
+       subtitle = "Points on the dashed line = BV adjustment changed nothing",
+       x = "Log2 FC, batch only", y = "Log2 FC, batch + BV")
+bv_adjust_plot
+save_plot(bv_adjust_plot, "q6_ring_fc_bv_adjusted")
+```
+
+```{r bv-explanation-stratified}
+# Ring versus systemic within each BV group
+ring_effect_in <- function(bv_group) {
+  keep <- gene_coldata$bv_status == bv_group
+  dds_sub <- DESeqDataSetFromMatrix(
+    countData = gene_counts_filtered[, keep],
+    colData   = gene_coldata[keep, ],
+    design    = ~ rnaseq_batch + delivery_group
+  )
+  dds_sub <- DESeq(dds_sub, quiet = TRUE)
+  results(dds_sub, contrast = c("delivery_group", "ring", "systemic")) |>
+    as.data.frame() |>
+    rownames_to_column("ensembl_gene_id") |>
+    dplyr::select(ensembl_gene_id, log2FoldChange)
+}
+
+table(gene_coldata$bv_status, gene_coldata$delivery_group)
+
+strata_fc <- sig_genes |>
+  select(ensembl_gene_id, symbol, log2FC_all = log2FoldChange) |>
+  left_join(rename(ring_effect_in("Positive"),     log2FC_BV_positive     = log2FoldChange), by = "ensembl_gene_id") |>
+  left_join(rename(ring_effect_in("Not positive"), log2FC_BV_not_positive = log2FoldChange), by = "ensembl_gene_id")
+
+tibble(
+  `Same direction in BV-positive women (%)`     = round(100 * mean(sign(strata_fc$log2FC_BV_positive)     == sign(strata_fc$log2FC_all)), 1),
+  `Same direction in BV-not-positive women (%)` = round(100 * mean(sign(strata_fc$log2FC_BV_not_positive) == sign(strata_fc$log2FC_all)), 1),
+  `Correlation between the two BV groups`       = round(cor(strata_fc$log2FC_BV_positive, strata_fc$log2FC_BV_not_positive), 3)
+) |>
+  pivot_longer(everything(), names_to = "Check", values_to = "Result") |>
+  knitr::kable(caption = "Is the ring effect seen in women with and without BV?")
+
+strata_plot <- ggplot(strata_fc, aes(log2FC_BV_not_positive, log2FC_BV_positive)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_vline(xintercept = 0, colour = "grey70") +
+  geom_point(colour = "#2166AC", alpha = 0.7) +
+  labs(title = "The 165 ring genes: ring effect within each BV group",
+       subtitle = "Points in the top-right and bottom-left = same direction in both groups",
+       x = "Log2 FC ring / systemic, BV not positive", y = "Log2 FC ring / systemic, BV positive")
+strata_plot
+save_plot(strata_plot, "q6_ring_fc_by_bv_stratum")
+```
+
+## Answer
+
+**No. BV does not explain the ring effect.** Neither condition for BV to
+explain it holds, and the ring genes survive both checks.
+
+* **(a) BV is not linked to the method.** BV positivity is similar across
+  arms (Question 2, p = 0.52): 38% in ring users, 43% in systemic users.
+* **(b) BV has only a small link to gene expression.** In the PERMANOVA with
+  both terms, BV explains 1.4% of the variation (p = 0.16) while delivery group
+  still explains 1.8% (p = 0.046). In DESeq2 only 18 genes differ by BV.
+* **Adjusting for BV changes almost nothing.** After adding BV to the model,
+  149 genes still differ between ring and systemic, **132 of the original 165
+  remain significant**, and the fold changes before and after adjustment are
+  almost identical (correlation 0.99; the points sit on the dashed line).
+* **The ring effect is seen with and without BV.** Analysing the two BV groups
+  separately, 96% of the 165 ring genes move in the same direction in
+  BV-positive women and 98% in BV-negative women. The groups are smaller
+  (39 and 54 women), so their estimates are noisier, but the direction holds.
+
+So the ring versus systemic difference is not a hidden BV effect.
+
+# Summary of answers
+
+| # | Question | Short answer |
+|---|---|---|
+| 1 | Do the methods differ in community composition? | **No.** Arm explains about 3% of the variation, PERMANOVA p = 0.09 to 0.21 for all three distances. |
+| 2 | Is BV more common in one arm? | **No.** 49% injectable, 36% pill, 38% ring; chi-square p = 0.52. |
+| 3 | Does the ring differ from systemic in gene expression? | **Yes, modestly.** No split on the PCA and overall PERMANOVA R² = 1.8% (p = 0.047), but 165 genes differ (88 up, 77 down in ring). |
+| 4 | Which processes do the ring genes point to? | **Cell division** (higher in ring) and **keratinisation / epidermis development** (higher in systemic). |
+| 5 | Does community type explain more than the method? | **Only partly.** More single genes (225 vs 115), but not more overall variation (R² 2.4% vs 2.7%, both not significant). |
+| 6 | Is BV the explanation for the method effect? | **No.** BV is not linked to method; after adjusting for BV, 132 of the 165 ring genes remain and the fold changes are unchanged (r = 0.99). |
+
+**The story in one paragraph.** Contraceptive method does not change which
+bacteria live in the vagina, and BV is equally common across the methods. The
+locally delivered ring, however, is linked to a modest but consistent change in
+the host's own genes: the vaginal lining of ring users shows more cell-division
+activity and less of the skin-like keratinisation programme seen with the pill
+and injectable. This ring effect is not explained by BV, and it is present in
+women with and without BV. The bacterial community type affects a different set
+of host genes, but neither the bacteria nor the method explains most of the
+variation between women. All results are associations in one cross-sectional
+dataset; they do not prove cause and effect.
+
+# Choices made (and alternatives)
+
+| Step | Choice | Alternative |
+|---|---|---|
+| Samples | All 93 kept (no QC failures) | Drop samples below a prespecified sequencing depth |
+| Community distances | Bray-Curtis, Jaccard and Aitchison | Use only one distance |
+| Community ordination / test | PCoA; PERMANOVA (999 permutations, seed 1) plus dispersion test | NMDS; tests on single taxa |
+| BV comparison | Positive vs not positive; chi-square, Fisher if any expected count < 5 | Test all three BV categories |
+| Gene groups | Ring vs systemic (pill + injectable) | Compare the three arms separately |
+| Gene filter | At least 10 reads in at least 10 samples | A stricter or looser filter |
+| Gene ordination | PCA of VST counts | PCoA or UMAP |
+| Gene overall test | PERMANOVA on Euclidean distance of VST values, batch first | Another distance |
+| Gene-by-gene test | DESeq2 on raw counts, adjusted for batch, BH padj < 0.05 | Add a fold-change threshold; limma-voom |
+| Enrichment | GO biological processes; ORA (background = tested genes) and GSEA (ranked by DESeq2 statistic) | KEGG or MSigDB Hallmark gene sets |
+| Community type | Dominant species rule (simplified CSTs) | VALENCIA classifier or hierarchical clustering |
+| Community vs method | PERMANOVA by margin and DESeq2 LRT in one model | Variance partitioning |
+| BV check | Adjust for BV and stratify by BV | Use Nugent score as a continuous variable |
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
+

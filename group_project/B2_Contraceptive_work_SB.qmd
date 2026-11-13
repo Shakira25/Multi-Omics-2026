@@ -1,0 +1,939 @@
+---
+title: "B2 Contraceptive project"
+format: html
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(microViz)
+library(phyloseq)
+
+```
+
+### Load data
+```{r}
+data_dir <- "data/2-workshop2/group_b_contraception"
+
+metadata <- read_csv(here(data_dir, "01_metadata.csv"))
+species  <- read_csv(here(data_dir, "02_microbiome_counts.csv"))    
+taxonomy <- read_csv(here(data_dir, "03_microbiome_taxonomy.csv"))
+genes    <- read_csv(here(data_dir, "04_rnaseq_counts.csv.gz")) 
+genes_2_annot <- read_csv(here(data_dir, "05_gene_annotation.csv"))   
+cytokine_df <- read_csv(here(data_dir, "06_cytokines.csv")) 
+```
+
+
+```{r}
+head(metadata)
+```
+
+### QC
+
+### Metadata
+```{r}
+# Number of rows and columns, and the column types
+dim(metadata) # 93 rows, 8 columns
+glimpse(metadata)
+
+# Missing values in each column
+metadata %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "column",
+    values_to = "missing"
+  ) %>%
+  arrange(desc(missing)) ## 0
+
+# Missing or duplicated sample IDs
+metadata %>%
+  count(sample_id, name = "rows_per_sample") %>%
+  filter(is.na(sample_id) | rows_per_sample > 1) ## 0
+
+# How many participants have each number of samples?
+metadata %>%
+  count(participant_id, name = "samples_per_participant") %>%
+  count(samples_per_participant, name = "participants") %>%
+  arrange(samples_per_participant) ## 1 sample per participant.
+
+# Counts for the categorical fields
+metadata %>% count(arm, sort = TRUE) # 39 in injectable, 28 on pill and 26 on ring
+metadata %>% count(bv, sort = TRUE) # 51 with BV,  39 with negative BV and 3 with intermediate BV
+metadata %>% count(any_sti, sort = TRUE) # 48 with any sti, 45 with no sti
+metadata %>% count(rnaseq_batch, sort = TRUE) # B1 are 47 and B2 are 46
+
+# Check the numeric fields for unexpected values
+summary(select(metadata, nugent, ph))
+```
+
+
+### QC for all the datasets
+
+```{r}
+datasets <- list(
+  metadata = metadata,
+  species = species,
+  taxonomy = taxonomy,
+  genes = genes,
+  genes_2_annot = genes_2_annot,
+  cytokine_df = cytokine_df
+)
+
+qc_table <- purrr::imap_dfr(datasets, function(data, dataset_name) {
+  tibble::tibble(
+    dataset = dataset_name,
+    rows = nrow(data),
+    columns = ncol(data),
+    missing_cells = sum(is.na(data)),
+    rows_with_missing = sum(!complete.cases(data)),
+    duplicate_rows = sum(duplicated(data))
+  )
+})
+
+knitr::kable(qc_table, caption = "Quality checks for loaded datasets")
+```
+
+
+```{r}
+datasets <- list(
+  metadata = metadata,
+  species = species,
+  taxonomy = taxonomy,
+  genes = genes,
+  genes_2_annot = genes_2_annot,
+  cytokine_df = cytokine_df
+)
+
+qc_data <- purrr::imap_dfr(datasets, function(data, dataset_name) {
+  tibble::tibble(
+    dataset = dataset_name,
+    rows = nrow(data),
+    columns = ncol(data),
+    missing_cells = sum(is.na(data)),
+    rows_with_missing = sum(!complete.cases(data)),
+    duplicate_rows = sum(duplicated(data))
+  )
+})
+
+qc_table <- qc_data %>%
+  gtsummary::tbl_summary(
+    by = dataset,
+    include = c(rows, columns, missing_cells, rows_with_missing, duplicate_rows),
+    statistic = gtsummary::all_continuous() ~ "{mean}",
+    digits = gtsummary::all_continuous() ~ 0,
+    label = list(
+      rows ~ "Rows",
+      columns ~ "Columns",
+      missing_cells ~ "Missing cells",
+      rows_with_missing ~ "Rows with missing values",
+      duplicate_rows ~ "Duplicate rows"
+    ),
+    missing = "no"
+  )
+
+qc_table  # Display the table in the rendered report
+
+gt::gtsave(
+  gtsummary::as_gt(qc_table),
+  filename = here::here("group_project", "qc_table.html")
+)
+
+```
+
+
+## Do the three methods differ in community composition?
+
+Each point is a sample, colored by its contraceptive arm (injectable, pill, or
+ring). Samples closer together have more similar species compositions under
+the chosen distance.
+
+### No they don't differ ni the community composition
+
+```{r}
+# Build the phyloseq object from the data frames loaded above.
+sample_ids <- names(species)[-1]
+feature_ids <- as.character(species[[1]])
+
+if (!setequal(metadata$sample_id, sample_ids)) {
+  stop("The species-table sample columns do not match metadata$sample_id.")
+}
+if (!setequal(feature_ids, taxonomy$taxon)) {
+  stop("The species-table features do not match taxonomy$taxon.")
+}
+
+count_matrix <- as.matrix(species[, -1])
+storage.mode(count_matrix) <- "numeric"
+rownames(count_matrix) <- feature_ids
+
+taxonomy_matrix <- as.matrix(taxonomy[
+  match(feature_ids, taxonomy$taxon),
+  setdiff(names(taxonomy), "taxon"),
+  drop = FALSE
+])
+storage.mode(taxonomy_matrix) <- "character"
+rownames(taxonomy_matrix) <- feature_ids
+
+metadata_for_ps <- as.data.frame(metadata)
+metadata_for_ps <- metadata_for_ps[
+  match(sample_ids, metadata_for_ps$sample_id),
+  ,
+  drop = FALSE
+]
+rownames(metadata_for_ps) <- metadata_for_ps$sample_id
+
+arm_levels <- c("injectable", "pill", "ring")
+metadata_for_ps$arm <- factor(metadata_for_ps$arm, levels = arm_levels)
+
+ps_species <- phyloseq::phyloseq(
+  phyloseq::otu_table(count_matrix, taxa_are_rows = TRUE),
+  phyloseq::sample_data(metadata_for_ps),
+  phyloseq::tax_table(taxonomy_matrix)
+)
+
+bray_plot <- ps_species |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("bray") |>
+  ord_calc("PCoA") |>
+  ord_plot(colour = "arm") +
+  ggplot2::labs(title = "Bray-Curtis")
+
+jaccard_plot <- ps_species |>
+  tax_transform("binary", rank = "species") |>
+  dist_calc("jaccard") |>
+  ord_calc("PCoA") |>
+  ord_plot(colour = "arm") +
+  ggplot2::labs(title = "Jaccard")
+
+aitchison_plot <- ps_species |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("aitchison") |>
+  ord_calc("PCoA") |>
+  ord_plot(colour = "arm") +
+  ggplot2::labs(title = "Aitchison")
+
+community_plot <- patchwork::wrap_plots(
+  bray_plot,
+  jaccard_plot,
+  aitchison_plot,
+  ncol = 3,
+  guides = "collect"
+) &
+  ggplot2::theme(legend.position = "bottom")
+
+community_plot
+
+plot_dir <- here::here("group_project", "plots")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+ggplot2::ggsave(
+  file.path(plot_dir, "community_distances_group_2.png"),
+  plot = community_plot, width = 15, height = 5.5, dpi = 300
+)
+ggplot2::ggsave(
+  file.path(plot_dir, "community_distances_group_2.pdf"),
+  plot = community_plot, width = 15, height = 5.5
+)
+```
+
+PERMANOVA tests whether community composition differs among arms. R² is the
+proportion of variation associated with arm; F is the test statistic; and the
+p-value measures evidence against no arm-associated difference. Interpret
+these alongside the plots and check group dispersion, since unequal within-arm
+spread can affect PERMANOVA.
+
+```{r}
+run_arm_permanova <- function(distance_name, transform_name) {
+  result <- ps_species |>
+    tax_transform(transform_name, rank = "species") |>
+    dist_calc(distance_name) |>
+    dist_permanova(variables = "arm", n_perms = 999, seed = 1) |>
+    perm_get() |>
+    as.data.frame()
+
+  tibble::tibble(
+    distance = distance_name,
+    R2 = result["arm", "R2"],
+    F = result["arm", "F"],
+    p_value = result["arm", "Pr(>F)"]
+  )
+}
+
+permanova_results <- dplyr::bind_rows(
+  run_arm_permanova("bray", "identity"),
+  run_arm_permanova("jaccard", "binary"),
+  run_arm_permanova("aitchison", "identity")
+) |>
+  dplyr::mutate(
+    distance = factor(
+      distance,
+      levels = c("bray", "jaccard", "aitchison"),
+      labels = c("Bray-Curtis", "Jaccard", "Aitchison")
+    )
+  )
+
+permanova_table_data <- permanova_results |>
+  dplyr::mutate(
+    p_value = dplyr::if_else(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) |>
+  dplyr::rename(
+    Test = distance,
+    `R-squared (R²)` = R2,
+    `F statistic` = F,
+    `P-value` = p_value
+  )
+
+permanova_gt <- gt::gt(permanova_table_data) |>
+  gt::tab_header(
+    title = gt::md("**PERMANOVA: Community composition by contraceptive arm**"),
+    subtitle = "Tests compare injectable, pill, and ring groups (999 permutations)"
+  ) |>
+  gt::fmt_number(columns = `R-squared (R²)`, decimals = 3) |>
+  gt::fmt_number(columns = `F statistic`, decimals = 2) |>
+  gt::cols_label(Test = "Distance metric") |>
+  gt::cols_align(align = "center", columns = -Test) |>
+  gt::tab_options(
+    table.width = gt::pct(100),
+    table.font.size = gt::px(14),
+    heading.title.font.size = gt::px(16),
+    data_row.padding = gt::px(6),
+    row.striping.include_table_body = TRUE
+  ) |>
+  gt::tab_source_note(
+    source_note = gt::md(
+      "R² is the proportion of community variation associated with contraceptive arm. P-values below 0.001 are shown as <0.001."
+    )
+  )
+
+permanova_gt
+
+table_dir <- here::here("group_project", "table")
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+gt::gtsave(
+  permanova_gt,
+  filename = file.path(table_dir, "community_permanova_group_2.html")
+)
+```
+
+### Community analysis choices
+
+- Distance: Bray-Curtis, Jaccard, and Aitchison; alternative: compare only one distance.
+- Transform: identity for Bray-Curtis and Aitchison, binary for Jaccard; alternative: use one transform for all.
+- Ordination: PCoA; alternative: NMDS.
+- Test: PERMANOVA with 999 permutations and seed 1; alternative: parametric tests on individual taxa.
+- Grouping: injectable, pill, and ring arms; alternative: test another metadata variable.
+- Samples dropped: none; alternative: apply a prespecified sequencing-depth threshold.
+
+
+### Is bacterial vaginosis more common in one arm? 
+
+#### Approach
+
+I will compare the percentage of participants with **positive BV** across the
+injectable, pill, and ring arms. For this comparison, negative and intermediate
+results are grouped as **not positive**; I will also show all three original
+BV categories in a separate table so the intermediate results remain visible.
+The main test is a Pearson chi-square test on the 2-by-3 table (positive versus
+not positive by arm). The code checks the expected cell counts and switches to
+Fisher's exact test if any expected count is below 5. This tests an association,
+not whether the contraceptive method caused BV. P-values are reported to three
+decimal places.
+
+```{r}
+bv_arm_levels <- c("injectable", "pill", "ring")
+bv_categories <- c("negative", "intermediate", "positive")
+
+if (!all(c("arm", "bv") %in% names(metadata))) {
+  stop("metadata must contain arm and bv columns.")
+}
+if (anyNA(metadata$arm) || anyNA(metadata$bv)) {
+  stop("Missing arm or BV values must be resolved before this comparison.")
+}
+if (!all(metadata$arm %in% bv_arm_levels)) {
+  stop("Unexpected arm values found in metadata.")
+}
+if (!all(metadata$bv %in% bv_categories)) {
+  stop("Unexpected BV categories found; check metadata$bv.")
+}
+
+bv_data <- metadata %>%
+  dplyr::mutate(
+    arm = factor(arm, levels = bv_arm_levels),
+    bv = factor(bv, levels = bv_categories),
+    bv_status = factor(
+      ifelse(bv == "positive", "Positive", "Not positive"),
+      levels = c("Not positive", "Positive")
+    )
+  )
+
+# Descriptive table: retain negative, intermediate, and positive BV categories.
+bv_categories_table <- gtsummary::tbl_cross(
+  data = bv_data,
+  row = bv,
+  col = arm,
+  percent = "column",
+  margin = "column",
+  digits = 1,
+  label = list(bv ~ "BV category", arm ~ "Contraceptive arm")
+) %>%
+  gtsummary::modify_caption(
+    "**BV categories by contraceptive arm**"
+  ) %>%
+  gtsummary::bold_labels()
+
+# Primary test: compare positive BV with negative/intermediate across arms.
+bv_status_counts <- table(bv_data$bv_status, bv_data$arm)
+bv_chisq <- stats::chisq.test(bv_status_counts, correct = FALSE)
+
+# Fisher's exact test is safer if the chi-square expected counts are too small.
+if (any(bv_chisq$expected < 5)) {
+  bv_test <- "fisher.test"
+  bv_test_name <- "Fisher's exact test"
+} else {
+  bv_test <- "chisq.test"
+  bv_test_name <- "Pearson chi-square test"
+}
+
+bv_prevalence_table <- gtsummary::tbl_cross(
+  data = bv_data,
+  row = bv_status,
+  col = arm,
+  percent = "column",
+  margin = "column",
+  digits = 1,
+  label = list(bv_status ~ "BV status", arm ~ "Contraceptive arm")
+) %>%
+  gtsummary::add_p(
+    test = bv_test,
+    pvalue_fun = gtsummary::label_style_pvalue(digits = 3)
+  ) %>%
+  gtsummary::modify_caption(
+    "**Positive BV prevalence by contraceptive arm**"
+  ) %>%
+  gtsummary::modify_footnote(
+    gtsummary::all_stat_cols() ~
+      paste0(
+        "Values are participant counts and percentages within arm. ",
+        bv_test_name,
+        " compares positive with not-positive BV; p-values are shown to 3 decimal places."
+      )
+  ) %>%
+  gtsummary::bold_labels()
+
+bv_categories_table
+bv_prevalence_table
+
+bv_table_dir <- here::here("group_project", "tables")
+dir.create(bv_table_dir, recursive = TRUE, showWarnings = FALSE)
+
+gt::gtsave(
+  gtsummary::as_gt(bv_categories_table),
+  filename = file.path(bv_table_dir, "bv_categories_by_arm_group_2.html")
+)
+gt::gtsave(
+  gtsummary::as_gt(bv_prevalence_table),
+  filename = file.path(bv_table_dir, "bv_prevalence_by_arm_group_2.html")
+)
+```
+
+```{r}
+# gtsummary selects a categorical test based on the observed cell counts.
+bv_summary_test_table <- bv_data |>
+  gtsummary::tbl_summary(
+    by = arm,
+    include = bv_status,
+    type = bv_status ~ "categorical",
+    statistic = gtsummary::all_categorical() ~ "{n} ({p}%)",
+    percent = "column",
+    missing = "no"
+  ) |>
+  gtsummary::add_p(
+    pvalue_fun = gtsummary::label_style_pvalue(digits = 3)
+  ) |>
+  gtsummary::modify_header(label = "**BV status**") |>
+  gtsummary::modify_caption(
+    "**Positive BV prevalence by contraceptive arm**"
+  ) |>
+  gtsummary::bold_labels()
+
+bv_summary_test_table
+
+gt::gtsave(
+  gtsummary::as_gt(bv_summary_test_table),
+  filename = file.path(bv_table_dir, "bv_summary_test_group_2.html")
+)
+```
+
+### The ring is delivered locally and the other two are systemic. Does the ring differ from the other two in host gene expression? start by ordinating the genes.
+
+#### Approach
+
+I will combine the pill and injectable arms into one **systemic** group and
+compare it with the **ring** group. First, I will make a PCA plot from
+variance-stabilized gene counts to see whether samples cluster by delivery
+group or RNA-seq batch. This is an exploratory overview, not a significance
+test. Then I will use DESeq2 on the original raw gene counts (not CPM or logged
+counts), adjusting for `rnaseq_batch`. Before testing, the code checks sample
+IDs and aligns the count columns to the metadata.
+
+I will filter out genes with fewer than 10 reads in at least 10 samples, then
+use Benjamini-Hochberg adjusted p-values (`padj`) to account for testing many
+genes. Positive log2 fold changes mean higher expression in the ring group.
+This tests an association in this dataset; it does not show that local delivery
+caused any expression difference.
+
+The code saves the plots as PNG and PDF, and saves the full results, test
+summary, and top 20 genes as CSV files in `group_project/`.
+
+```{r}
+feature_id_col <- names(genes)[1]
+sample_ids <- names(genes)[-1]
+
+if (!all(c("sample_id", "arm", "rnaseq_batch") %in% names(metadata))) {
+  stop("metadata must contain sample_id, arm, and rnaseq_batch.")
+}
+if (anyNA(metadata$sample_id) || anyDuplicated(metadata$sample_id)) {
+  stop("metadata sample IDs are missing or duplicated.")
+}
+if (!setequal(sample_ids, metadata$sample_id)) {
+  stop("RNA-seq sample columns do not match metadata$sample_id.")
+}
+if (anyDuplicated(sample_ids)) {
+  stop("The RNA-seq table contains duplicated sample columns.")
+}
+if (anyNA(genes[[feature_id_col]]) || anyDuplicated(genes[[feature_id_col]])) {
+  stop("RNA-seq feature IDs are missing or duplicated.")
+}
+if (!all(metadata$arm %in% c("ring", "pill", "injectable"))) {
+  stop("Unexpected or missing contraceptive arm values in metadata.")
+}
+if (anyNA(metadata$rnaseq_batch)) {
+  stop("Some samples are missing their RNA-seq batch assignment.")
+}
+
+# Keep the raw counts and align their columns to the metadata rows.
+gene_counts <- as.matrix(genes[, sample_ids, drop = FALSE])
+storage.mode(gene_counts) <- "numeric"
+rownames(gene_counts) <- as.character(genes[[feature_id_col]])
+gene_counts <- gene_counts[, metadata$sample_id, drop = FALSE]
+
+if (any(!is.finite(gene_counts)) || any(gene_counts < 0)) {
+  stop("RNA-seq counts contain missing, non-finite, or negative values.")
+}
+if (any(abs(gene_counts - round(gene_counts)) > 1e-8)) {
+  stop("DESeq2 requires raw integer counts; non-integer values were found.")
+}
+storage.mode(gene_counts) <- "integer"
+
+gene_coldata <- metadata %>%
+  dplyr::select(sample_id, arm, rnaseq_batch) %>%
+  dplyr::mutate(
+    delivery_group = factor(
+      ifelse(arm == "ring", "ring", "systemic"),
+      levels = c("systemic", "ring")
+    ),
+    rnaseq_batch = factor(rnaseq_batch)
+  ) %>%
+  as.data.frame()
+rownames(gene_coldata) <- gene_coldata$sample_id
+
+# Check whether batch and delivery group can be estimated separately.
+design_matrix <- stats::model.matrix(
+  ~ rnaseq_batch + delivery_group,
+  data = gene_coldata
+)
+if (qr(design_matrix)$rank < ncol(design_matrix)) {
+  stop("RNA-seq batch is confounded with delivery group; cannot fit both terms.")
+}
+
+# Prefilter genes with fewer than 10 reads in at least 10 samples.
+keep_gene <- rowSums(gene_counts >= 10) >= 10
+gene_counts_filtered <- gene_counts[keep_gene, , drop = FALSE]
+if (nrow(gene_counts_filtered) == 0) {
+  stop("No genes passed the expression filter.")
+}
+
+# Explore overall sample patterns using a variance-stabilizing transformation.
+dds_for_pca <- DESeq2::DESeqDataSetFromMatrix(
+  countData = gene_counts_filtered,
+  colData = gene_coldata,
+  design = ~ rnaseq_batch + delivery_group
+)
+vsd <- DESeq2::vst(dds_for_pca, blind = TRUE)
+pca_data <- DESeq2::plotPCA(
+  vsd,
+  intgroup = c("delivery_group", "rnaseq_batch"),
+  returnData = TRUE
+)
+pca_percent <- round(100 * attr(pca_data, "percentVar"))
+
+gene_pca_plot <- ggplot2::ggplot(
+  pca_data,
+  ggplot2::aes(
+    x = PC1,
+    y = PC2,
+    color = delivery_group,
+    shape = rnaseq_batch
+  )
+) +
+  ggplot2::geom_point(size = 3, alpha = 0.85) +
+  ggplot2::labs(
+    title = "PCA of host gene expression",
+    subtitle = "Ring versus systemic contraceptive arms",
+    x = paste0("PC1 (", pca_percent[1], "%)"),
+    y = paste0("PC2 (", pca_percent[2], "%)"),
+    color = "Delivery group",
+    shape = "RNA-seq batch"
+  ) +
+  ggplot2::theme_minimal()
+
+gene_pca_plot
+
+gene_plot_dir <- here::here("group_project", "plots")
+dir.create(gene_plot_dir, recursive = TRUE, showWarnings = FALSE)
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_pca_ring_vs_systemic_group_2.png"),
+  plot = gene_pca_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_pca_ring_vs_systemic_group_2.pdf"),
+  plot = gene_pca_plot,
+  width = 8,
+  height = 6
+)
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = gene_counts_filtered,
+  colData = gene_coldata,
+  design = ~ rnaseq_batch + delivery_group
+)
+dds <- DESeq2::DESeq(dds)
+
+# Positive log2 fold changes mean higher expression in ring than systemic.
+gene_results <- DESeq2::results(
+  dds,
+  contrast = c("delivery_group", "ring", "systemic"),
+  alpha = 0.05
+)
+
+gene_results_table <- as.data.frame(gene_results) %>%
+  tibble::rownames_to_column(feature_id_col) %>%
+  dplyr::left_join(
+    genes_2_annot,
+    by = stats::setNames("ensembl_gene_id", feature_id_col)
+  ) %>%
+  dplyr::arrange(padj)
+
+gene_test_summary <- tibble::tibble(
+  samples_ring = sum(gene_coldata$delivery_group == "ring"),
+  samples_systemic = sum(gene_coldata$delivery_group == "systemic"),
+  genes_tested = nrow(gene_results_table),
+  genes_with_adjusted_p_below_0_05 = sum(gene_results_table$padj < 0.05, na.rm = TRUE)
+)
+
+knitr::kable(gene_test_summary, caption = "DESeq2 test summary")
+knitr::kable(
+  gene_results_table %>%
+    dplyr::filter(!is.na(padj)) %>%
+    dplyr::slice_head(n = 20) %>%
+    dplyr::select(
+      dplyr::all_of(feature_id_col), symbol, gene_name,
+      baseMean, log2FoldChange, pvalue, padj
+    ),
+  digits = 3,
+  caption = "Top 20 genes by adjusted p-value"
+)
+
+gene_results_dir <- here::here("group_project")
+readr::write_csv(
+  gene_results_table,
+  file.path(gene_results_dir, "genes_ring_vs_systemic_group_2.csv")
+)
+
+head(gene_results_table)
+
+readr::write_csv(
+  gene_test_summary,
+  file.path(gene_results_dir, "genes_ring_vs_systemic_summary_group_2.csv")
+)
+readr::write_csv(
+  gene_results_table %>%
+    dplyr::filter(!is.na(padj)) %>%
+    dplyr::slice_head(n = 20) %>%
+    dplyr::select(
+      dplyr::all_of(feature_id_col), symbol, gene_name,
+      baseMean, log2FoldChange, pvalue, padj
+    ),
+  file.path(gene_results_dir, "genes_ring_vs_systemic_top20_group_2.csv")
+)
+```
+
+### What else could explain the gene patterns?
+
+PC1 explains about a third of the variation, but neither delivery group nor
+batch lines up with it. These plots colour the same PCA by BV status, by the
+three arms, and by pH, to see what PC1 is picking up. The PERMANOVA then asks
+one overall question: do ring and systemic samples differ across all genes
+together, after accounting for batch? The dispersion test checks that any
+difference is not just one group being more spread out.
+
+```{r}
+# Reuse the variance-stabilized counts (vsd) from the PCA above.
+# pca_data already carries sample_id and arm, so only add bv and ph.
+pca_extra <- pca_data %>%
+  dplyr::left_join(
+    metadata %>% dplyr::select(sample_id, bv, ph),
+    by = "sample_id"
+  )
+
+pca_labs <- ggplot2::labs(
+  x = paste0("PC1 (", pca_percent[1], "%)"),
+  y = paste0("PC2 (", pca_percent[2], "%)")
+)
+
+ggplot2::ggplot(pca_extra, ggplot2::aes(PC1, PC2, color = bv)) +
+  ggplot2::geom_point(size = 3, alpha = 0.85) +
+  ggplot2::labs(title = "Host gene PCA coloured by BV status", color = "BV") +
+  pca_labs + ggplot2::theme_minimal()
+
+ggplot2::ggplot(pca_extra, ggplot2::aes(PC1, PC2, color = arm)) +
+  ggplot2::geom_point(size = 3, alpha = 0.85) +
+  ggplot2::labs(title = "Host gene PCA coloured by arm", color = "Arm") +
+  pca_labs + ggplot2::theme_minimal()
+
+ggplot2::ggplot(pca_extra, ggplot2::aes(PC1, PC2, color = ph)) +
+  ggplot2::geom_point(size = 3, alpha = 0.85) +
+  ggplot2::scale_color_viridis_c() +
+  ggplot2::labs(title = "Host gene PCA coloured by vaginal pH", color = "pH") +
+  pca_labs + ggplot2::theme_minimal()
+
+# PERMANOVA: Euclidean distance on vst values (the same space as the PCA).
+vst_matrix <- t(SummarizedExperiment::assay(vsd))
+vst_dist <- stats::dist(vst_matrix)
+perm_data <- gene_coldata[rownames(vst_matrix), , drop = FALSE]
+
+set.seed(1)
+gene_permanova <- vegan::adonis2(
+  vst_dist ~ rnaseq_batch + delivery_group,
+  data = perm_data,
+  permutations = 999,
+  by = "terms"
+)
+gene_permanova
+
+# Is the spread of samples around each group's centre similar?
+gene_dispersion <- vegan::betadisper(vst_dist, perm_data$delivery_group)
+set.seed(1)
+vegan::permutest(gene_dispersion, permutations = 999)
+```
+
+### Visualize the differential-expression results
+
+The volcano plot shows the estimated change and adjusted p-value for every
+tested gene. The boxplots show variance-stabilized expression for up to six
+top-ranked genes, and the heatmap shows the top 20 genes across samples. These
+are visual summaries; the DESeq2 adjusted p-values remain the basis for
+statistical evidence.
+
+```{r}
+volcano_data <- gene_results_table %>%
+  dplyr::filter(!is.na(padj), is.finite(log2FoldChange)) %>%
+  dplyr::mutate(
+    neg_log10_padj = -log10(pmax(padj, .Machine$double.xmin)),
+    result = dplyr::if_else(
+      padj < 0.05,
+      ifelse(log2FoldChange > 0, "Higher in ring", "Higher in systemic"),
+      "Not significant"
+    )
+  )
+
+volcano_plot <- ggplot2::ggplot(
+  volcano_data,
+  ggplot2::aes(x = log2FoldChange, y = neg_log10_padj, color = result)
+) +
+  ggplot2::geom_point(alpha = 0.65, size = 1.4) +
+  ggplot2::geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed",
+    color = "grey35"
+  ) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    linetype = "dotted",
+    color = "grey35"
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Higher in ring" = "#B2182B",
+      "Higher in systemic" = "#2166AC",
+      "Not significant" = "grey70"
+    )
+  ) +
+  ggplot2::labs(
+    title = "Differential host gene expression",
+    subtitle = "Ring versus systemic arms; DESeq2 adjusted p-values",
+    x = "Log2 fold change (ring / systemic)",
+    y = expression(-log[10]("adjusted p-value")),
+    color = NULL
+  ) +
+  ggplot2::theme_minimal()
+
+volcano_plot
+
+ranked_genes <- gene_results_table %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::arrange(padj)
+if (nrow(ranked_genes) == 0) {
+  stop("No genes have an adjusted p-value available for plotting.")
+}
+
+boxplot_gene_ids <- ranked_genes %>%
+  dplyr::slice_head(n = 6) %>%
+  dplyr::pull(dplyr::all_of(feature_id_col))
+
+vst_matrix <- SummarizedExperiment::assay(vsd)
+boxplot_data <- as.data.frame(vst_matrix[boxplot_gene_ids, , drop = FALSE]) %>%
+  tibble::rownames_to_column("feature_id") %>%
+  tidyr::pivot_longer(
+    cols = -feature_id,
+    names_to = "sample_id",
+    values_to = "vst_expression"
+  ) %>%
+  dplyr::left_join(
+    gene_coldata %>%
+      dplyr::select(sample_id, delivery_group, rnaseq_batch),
+    by = "sample_id"
+  )
+
+boxplot_plot <- ggplot2::ggplot(
+  boxplot_data,
+  ggplot2::aes(x = delivery_group, y = vst_expression, fill = delivery_group)
+) +
+  ggplot2::geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  ggplot2::geom_jitter(width = 0.12, alpha = 0.5, size = 1) +
+  ggplot2::facet_wrap(~ feature_id, scales = "free_y", ncol = 3) +
+  ggplot2::labs(
+    title = "Expression of the six top-ranked genes",
+    x = "Delivery group",
+    y = "Variance-stabilized expression",
+    fill = "Delivery group"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none")
+
+boxplot_plot
+
+heatmap_gene_ids <- ranked_genes %>%
+  dplyr::slice_head(n = 20) %>%
+  dplyr::pull(dplyr::all_of(feature_id_col))
+heatmap_matrix <- vst_matrix[heatmap_gene_ids, , drop = FALSE]
+heatmap_z <- t(scale(t(heatmap_matrix)))
+heatmap_z[!is.finite(heatmap_z)] <- 0
+
+heatmap_data <- as.data.frame(heatmap_z) %>%
+  tibble::rownames_to_column("feature_id") %>%
+  tidyr::pivot_longer(
+    cols = -feature_id,
+    names_to = "sample_id",
+    values_to = "row_z_score"
+  ) %>%
+  dplyr::left_join(
+    gene_coldata %>%
+      dplyr::select(sample_id, delivery_group, rnaseq_batch),
+    by = "sample_id"
+  ) %>%
+  dplyr::mutate(
+    feature_id = factor(feature_id, levels = rev(heatmap_gene_ids)),
+    sample_id = factor(sample_id, levels = gene_coldata$sample_id)
+  )
+
+heatmap_plot <- ggplot2::ggplot(
+  heatmap_data,
+  ggplot2::aes(x = sample_id, y = feature_id, fill = row_z_score)
+) +
+  ggplot2::geom_tile() +
+  ggplot2::facet_grid(
+    ~ delivery_group,
+    scales = "free_x",
+    space = "free_x",
+    switch = "x"
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    name = "Gene\nz-score"
+  ) +
+  ggplot2::labs(
+    title = "Top 20 genes across samples",
+    subtitle = "Genes ranked by adjusted p-value; samples grouped by delivery arm",
+    x = "Sample",
+    y = "Gene ID"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_blank(),
+    axis.ticks.x = ggplot2::element_blank(),
+    panel.grid = ggplot2::element_blank(),
+    strip.placement = "outside"
+  )
+
+volcano_plot
+boxplot_plot
+heatmap_plot
+
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_volcano_group_2.png"),
+  plot = volcano_plot, width = 8, height = 6, dpi = 300
+)
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_volcano_group_2.pdf"),
+  plot = volcano_plot, width = 8, height = 6
+)
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_boxplots_group_2.png"),
+  plot = boxplot_plot, width = 10, height = 7, dpi = 300
+)
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_boxplots_group_2.pdf"),
+  plot = boxplot_plot, width = 10, height = 7
+)
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_heatmap_group_2.png"),
+  plot = heatmap_plot, width = 12, height = 7, dpi = 300
+)
+ggplot2::ggsave(
+  file.path(gene_plot_dir, "host_gene_heatmap_group_2.pdf"),
+  plot = heatmap_plot, width = 12, height = 7
+)
+```
+
+## Choices made
+
+- Community distances: Bray-Curtis, Jaccard, and Aitchison; alternative: use only one distance.
+- Community transform: identity for Bray-Curtis and Aitchison, binary for Jaccard; alternative: use one transform for all.
+- Community ordination: PCoA; alternative: NMDS.
+- Community test: PERMANOVA with 999 permutations and seed 1; alternative: parametric tests on individual taxa.
+- Community grouping: injectable, pill, and ring; alternative: test another metadata variable.
+- Gene-expression ordination: PCA of variance-stabilized counts, colored by delivery group and shaped by RNA-seq batch; alternative: UMAP or PCoA.
+- Gene-expression overall test: PERMANOVA (999 permutations, seed 1) on Euclidean distance of variance-stabilized counts, batch entered first; alternative: Bray-Curtis or Aitchison distance.
+- Gene-expression spread check: betadisper dispersion test; alternative: skip it and rely on PERMANOVA alone.
+- Gene-expression PCA extras: coloured by BV, arm and pH; alternative: add BV as a term in the DESeq2 model.
+- Gene-expression test: DESeq2 on raw counts, ring versus pill plus injectable; alternative: compare the three arms separately.
+- Gene-expression model: adjust for RNA-seq batch; alternative: omit batch if it was not part of the design.
+- Gene filter: at least 10 reads in at least 10 samples; alternative: use a stricter or looser prespecified filter.
+- Gene-expression plots: volcano plot, boxplots for the six top-ranked genes, and a row-scaled heatmap for the top 20; alternative: choose genes using a fixed fold-change threshold.
+- BV comparison: Pearson chi-square for positive versus not-positive BV when expected counts are all at least 5, otherwise Fisher's exact test; alternative: test the full three-category distribution.
+- Samples dropped: none; alternative: exclude samples only for a documented QC reason.

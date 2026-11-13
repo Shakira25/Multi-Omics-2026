@@ -66,13 +66,432 @@ ps_genes   <- add_groups(ps_genes)
 
 - *Your answer:*
 
+```{r}
+library(microViz)
+
+bray_plot <- ps_species |>
+  tax_transform("identity", rank = "species") |>
+  dist_calc("bray") |>
+  ord_calc("PCoA") |>
+  ord_plot(colour = "community")
+
+jaccard_plot <- ps_species |>
+  tax_transform("binary", rank = "species") |>
+  dist_calc("jaccard") |>
+  ord_calc("PCoA") |>
+  ord_plot(colour = "community")
+
+bray_plot
+jaccard_plot
+
+ggsave("plots/bray.png", bray_plot, width = 8, height = 6, dpi = 300)
+ggsave("plots/jaccard.png", jaccard_plot, width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+run_test <- function(distance_name, transform_name) {
+  result <- ps_species |>
+    tax_transform(transform_name, rank = "species") |>
+    dist_calc(distance_name) |>
+    dist_permanova(variables = "community", n_perms = 999, seed = 1) |>
+    perm_get() |>
+    as.data.frame()
+
+  tibble::tibble(
+    distance = distance_name,
+    R2 = result["community", "R2"],
+    F = result["community", "F"],
+    p_value = result["community", "Pr(>F)"]
+  )
+}
+
+dplyr::bind_rows(
+  run_test("bray", "identity"),
+  run_test("jaccard", "binary")
+)
+
+
+results <- dplyr::bind_rows(
+  run_test("bray", "identity"),
+  run_test("jaccard", "binary")
+)
+
+results
+
+formatted_results <- results |>
+  gtsummary::tbl_summary(
+    by = distance,
+    include = c(R2, F, p_value),
+    type = list(
+      R2 ~ "continuous",
+      F ~ "continuous",
+      p_value ~ "continuous"
+    ),
+    statistic = list(gtsummary::all_continuous() ~ "{mean}"),
+    digits = list(R2 ~ 3, F ~ 1, p_value ~ 3),
+    missing = "no"
+  ) |>
+  gtsummary::modify_header(
+    label = "**Measure**",
+    gtsummary::all_stat_cols() ~ "**{level}**"
+  ) |>
+  gtsummary::bold_labels()
+
+gt::gtsave(
+  gtsummary::as_gt(formatted_results),
+  filename = here::here("plots/formatted_results.html")
+)
+
+formatted_results
+```
+
+
 **2. Shuffling `outcome` randomly across 471 samples, what R2 would PERMANOVA report?**
 
 - *Your answer:*
 
+```{r}
+
+get_outcome_r2 <- function(ps) {
+  ps |>
+    tax_transform("identity", rank = "species") |>
+    dist_calc("bray") |>
+    dist_permanova(variables = "outcome", n_perms = 999, seed = 1) |>
+    perm_get() |>
+    as.data.frame() |>
+    tibble::rownames_to_column("term") |>
+    dplyr::filter(term == "outcome") |>
+    dplyr::pull(R2)
+}
+
+# R² using the original outcome labels
+observed_r2 <- get_outcome_r2(ps_species)
+
+# Shuffle outcome labels across samples, keeping the species data unchanged
+set.seed(2026)
+ps_shuffled <- ps_species
+metadata <- as.data.frame(phyloseq::sample_data(ps_shuffled))
+metadata$outcome <- sample(metadata$outcome)
+phyloseq::sample_data(ps_shuffled) <- phyloseq::sample_data(metadata)
+
+shuffled_r2 <- get_outcome_r2(ps_shuffled)
+
+tibble::tibble(
+  labels = c("Original outcome", "Shuffled outcome"),
+  R2 = c(observed_r2, shuffled_r2)
+) # it will sit at p028 week 18
+```
+
+
+
 **3. Where will the 438-read sample sit in a Bray-Curtis ordination?**
 
 - *Your answer:*
+
+```{r}
+
+counts <- as(phyloseq::otu_table(ps_species), "matrix")
+if (phyloseq::taxa_are_rows(ps_species)) {
+  counts <- t(counts)
+}
+
+low_read_id <- rownames(counts)[rowSums(counts) == 438]
+stopifnot(length(low_read_id) == 1)
+
+bray <- vegan::vegdist(counts, method = "bray")
+ordination <- cmdscale(bray, k = 2)
+
+plot_data <- data.frame(
+  sample_id = rownames(ordination),
+  Axis1 = ordination[, 1],
+  Axis2 = ordination[, 2],
+  community = phyloseq::sample_data(ps_species)$community
+)
+
+cat("438-read sample:", low_read_id, "\n")
+
+plot_data
+
+# Its position on the two ordination axes
+plot_data |>
+  dplyr::filter(sample_id == low_read_id) |>
+  print()
+
+# The five most similar samples by Bray-Curtis distance
+bc <- as.matrix(bray)
+nearest <- sort(bc[low_read_id, setdiff(rownames(bc), low_read_id)])
+head(nearest, 5)
+
+p <- ggplot(plot_data, aes(Axis1, Axis2, colour = community)) +
+  geom_point() +
+  geom_label(
+    data = subset(plot_data, sample_id == low_read_id),
+    aes(label = sample_id),
+    show.legend = FALSE
+  ) +
+  labs(title = "Bray-Curtis PCoA: 438-read sample")
+
+ggplot2::ggsave(
+  "plots/bray_438_sample.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+
+bray <- vegan::vegdist(counts, method = "bray")
+
+# Calculate the first two PCoA axes and their share of positive variation
+ordination <- cmdscale(bray, k = 2, eig = TRUE)
+points <- ordination$points
+positive_eigenvalues <- ordination$eig[ordination$eig > 0]
+axis_percent <- 100 * ordination$eig[1:2] / sum(positive_eigenvalues)
+
+# Compare the 438-read sample's mean distance with the overall mean pairwise distance
+bc <- as.matrix(bray)
+other_ids <- setdiff(rownames(bc), low_read_id)
+sample_mean <- mean(bc[low_read_id, other_ids])
+overall_pairwise_mean <- mean(bc[lower.tri(bc)])
+
+cat(sprintf(
+  "%s mean distance to all other samples: %.3f\nOverall mean pairwise distance: %.3f\n",
+  low_read_id, sample_mean, overall_pairwise_mean
+))
+
+plot_data <- data.frame(
+  sample_id = rownames(points),
+  Axis1 = points[, 1],
+  Axis2 = points[, 2],
+  community = as.data.frame(phyloseq::sample_data(ps_species))[
+    rownames(points), "community"
+  ]
+)
+
+p <- ggplot(plot_data, aes(Axis1, Axis2, colour = community)) +
+  geom_point() +
+  geom_label(
+    data = subset(plot_data, sample_id == low_read_id),
+    aes(label = sample_id),
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Bray-Curtis PCoA: 438-read sample",
+    subtitle = sprintf(
+      "438-read sample mean distance: %.3f; overall pairwise mean: %.3f",
+      sample_mean, overall_pairwise_mean
+    ),
+    x = sprintf("Axis 1 (%.1f%%)", axis_percent[1]),
+    y = sprintf("Axis 2 (%.1f%%)", axis_percent[2])
+  )
+
+ggplot2::ggsave(
+  "plots/bray_438_sample.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+```
+
+
+```{r}
+counts <- as(phyloseq::otu_table(ps_species), "matrix")
+if (phyloseq::taxa_are_rows(ps_species)) {
+  counts <- t(counts)  # Make samples rows and species columns
+}
+
+low_read_id <- rownames(counts)[rowSums(counts) == 438]
+if (length(low_read_id) != 1) {
+  stop("Expected one sample with 438 reads; found ", length(low_read_id), ".")
+}
+
+# Bray-Curtis distances between samples
+bray <- vegan::vegdist(counts, method = "bray")
+bc <- as.matrix(bray)
+
+# Compare the 438-read sample's mean distance with the overall pairwise mean
+other_samples <- setdiff(rownames(bc), low_read_id)
+mean_distance_from_438 <- mean(bc[low_read_id, other_samples])
+overall_mean_pairwise_distance <- mean(bc[lower.tri(bc)])
+
+cat(sprintf(
+  "%s mean distance to other samples: %.3f\nOverall mean pairwise distance: %.3f\n",
+  low_read_id, mean_distance_from_438, overall_mean_pairwise_distance
+))
+
+# PCoA coordinates and the share of positive variation on each axis
+ordination <- cmdscale(bray, k = 2, eig = TRUE)
+points <- ordination$points
+positive_eigenvalues <- ordination$eig[ordination$eig > 0]
+axis_percent <- 100 * ordination$eig[1:2] / sum(positive_eigenvalues)
+
+metadata <- as.data.frame(phyloseq::sample_data(ps_species))
+plot_data <- data.frame(
+  sample_id = rownames(points),
+  Axis1 = points[, 1],
+  Axis2 = points[, 2],
+  community = metadata[rownames(points), "community"]
+)
+
+p <- ggplot2::ggplot(
+  plot_data,
+  ggplot2::aes(Axis1, Axis2, colour = community)
+) +
+  ggplot2::geom_point() +
+  ggplot2::geom_label(
+    data = subset(plot_data, sample_id == low_read_id),
+    ggplot2::aes(label = sample_id),
+    show.legend = FALSE
+  ) +
+  ggplot2::labs(
+    title = "Bray-Curtis PCoA: 438-read sample",
+    subtitle = sprintf(
+      "mean_distance_from_438: %.3f; overall_mean_pairwise_distance: %.3f",
+      mean_distance_from_438, overall_mean_pairwise_distance
+    ),
+    x = sprintf("Axis 1 (%.1f%%)", axis_percent[1]),
+    y = sprintf("Axis 2 (%.1f%%)", axis_percent[2])
+  )
+
+dir.create("plots", showWarnings = FALSE)
+ggplot2::ggsave(
+  "plots/bray_438_sample.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+```{r}
+counts <- as(phyloseq::otu_table(ps_species), "matrix")
+if (phyloseq::taxa_are_rows(ps_species)) {
+  counts <- t(counts)  # Samples are rows; species are columns
+}
+
+low_read_id <- rownames(counts)[rowSums(counts) == 438]
+if (length(low_read_id) != 1) {
+  stop("Expected one sample with 438 reads; found ", length(low_read_id), ".")
+}
+
+# Convert each sample to relative abundances
+library_sizes <- rowSums(counts)
+if (any(library_sizes == 0)) {
+  stop("Cannot calculate relative abundances: at least one sample has zero reads.")
+}
+relative_counts <- sweep(counts, 1, library_sizes, "/")
+
+# Bray-Curtis distances on relative abundances
+bray <- vegan::vegdist(relative_counts, method = "bray")
+bc <- as.matrix(bray)
+
+# Mean distance from the 438-read sample and overall mean across unique pairs
+other_samples <- setdiff(rownames(bc), low_read_id)
+mean_distance_from_438 <- mean(bc[low_read_id, other_samples])
+overall_mean_pairwise_distance <- mean(bc[lower.tri(bc)])
+
+print(data.frame(
+  sample_id = low_read_id,
+  reads = library_sizes[low_read_id],
+  mean_distance_from_438 = mean_distance_from_438,
+  overall_mean_pairwise_distance = overall_mean_pairwise_distance
+))
+
+# Calculate PCoA coordinates and the share of positive variation per axis
+ordination <- cmdscale(bray, k = 2, eig = TRUE)
+points <- ordination$points
+positive_eigenvalues <- ordination$eig[ordination$eig > 0]
+axis_percent <- 100 * ordination$eig[1:2] / sum(positive_eigenvalues)
+
+metadata <- as.data.frame(phyloseq::sample_data(ps_species))
+plot_data <- data.frame(
+  sample_id = rownames(points),
+  Axis1 = points[, 1],
+  Axis2 = points[, 2],
+  community = metadata[rownames(points), "community"]
+)
+
+p <- ggplot2::ggplot(
+  plot_data,
+  ggplot2::aes(Axis1, Axis2, colour = community)
+) +
+  ggplot2::geom_point() +
+  ggplot2::geom_label(
+    data = subset(plot_data, sample_id == low_read_id),
+    ggplot2::aes(label = sample_id),
+    show.legend = FALSE
+  ) +
+  ggplot2::labs(
+    title = "Bray-Curtis PCoA: 438-read sample",
+    subtitle = sprintf(
+      "mean_distance_from_438: %.3f; overall_mean_pairwise_distance: %.3f",
+      mean_distance_from_438, overall_mean_pairwise_distance
+    ),
+    x = sprintf("Axis 1 (%.1f%%)", axis_percent[1]),
+    y = sprintf("Axis 2 (%.1f%%)", axis_percent[2])
+  )
+
+dir.create("plots", showWarnings = FALSE)
+ggplot2::ggsave(
+  "plots/bray_438_sample.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+# Code from pi
+```{r}
+
+source(here::here("R/count_tables.R"))
+library(vegan)
+
+d <- read_counts("instructional")
+lib <- colSums(d$species)
+
+if (any(lib == 0)) {
+  stop("A sample has zero reads, so its relative abundances cannot be calculated.")
+}
+
+# Calculate relative abundances, then Bray-Curtis distances between samples
+rel <- sweep(d$species, 2, lib, "/")
+bc_dist <- vegdist(t(rel), method = "bray")
+pco <- cmdscale(bc_dist, k = 2)
+
+# Colour samples by library-size group and save the plot
+depth_group <- cut(lib, breaks = 3)
+png("plots/library_depth_pcoa.png", width = 900, height = 700)
+plot(pco, col = as.integer(depth_group), pch = 19,
+     xlab = "PCoA axis 1", ylab = "PCoA axis 2")
+legend("topright", legend = levels(depth_group),
+       col = seq_along(levels(depth_group)), pch = 19,
+       title = "Library size")
+dev.off()
+
+# Find the sample with exactly 438 reads
+sample_438 <- names(lib)[lib == 438]
+if (length(sample_438) != 1) {
+  stop("Expected one sample with 438 reads; found ", length(sample_438), ".")
+}
+
+# Compare its mean distance to other samples with the overall mean pairwise distance
+bc <- as.matrix(bc_dist)
+other_samples <- setdiff(colnames(bc), sample_438)
+
+data.frame(
+  sample_id = sample_438,
+  reads = unname(lib[sample_438]),
+  mean_distance_from_438 = mean(bc[sample_438, other_samples]),
+  overall_mean_pairwise_distance = mean(bc[lower.tri(bc)])
+)
+```
+
 
 ## Part 2 — Ask, look, decide
 
@@ -82,9 +501,48 @@ Suggested request: *Using `ps_species` from the setup chunk, make a Bray-Curtis
 PCoA with microViz at the species level and colour it by `community`. Put the
 share of variation on each axis title.*
 
+```{r}
+bray_plot <- ps_species |>
+  microViz::tax_transform("identity", rank = "species") |>
+  microViz::dist_calc("bray") |>
+  microViz::ord_calc("PCoA") |>
+  microViz::ord_plot(colour = "community")
+
+# Save the plot so you can open it in VS Code
+dir.create("plots", showWarnings = FALSE)
+ggplot2::ggsave(
+  "plots/bray_community_pcoa.png",
+  plot = bray_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
 - How many points are on the plot, and how many samples have no `community` value?
   - *Your answer:*
 
+```{r}
+metadata <- as.data.frame(phyloseq::sample_data(ps_species))
+community <- as.character(metadata$community)
+
+tibble::tibble(
+  points_on_plot = phyloseq::nsamples(ps_species),
+  samples_without_community = sum(
+    is.na(community) | trimws(community) == ""
+  )
+) # 471 point on plot and 0 samples without community value
+```
+
+
+### From pi
+```{r}
+ # number of samples with no community value
+   sum(is.na(sample_data(ps_species)$community))   # → 0
+
+   # quick visual cross-check: the legend's two colours vs group sizes
+   table(sample_data(ps_species)$community) # 471
+```
 ### Step 2: three distances, side by side
 
 Suggested request: *Make the same ordination three ways, side by side:
